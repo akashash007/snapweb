@@ -1,595 +1,487 @@
+import { useCallback, useRef, useState } from 'react'
 
-import { useMemo, useState } from "react"
+type TargetFormat = 'webp' | 'jpeg' | 'png'
 
-type FileStatus = "pending" | "converting" | "done"
+type FileStatus = 'idle' | 'converting' | 'done' | 'error'
 
-type AppFile = {
+interface QueueItem {
   id: string
-  name: string
+  file: File
   originalSize: number
-  originalFormat: string
+  originalExt: string
   status: FileStatus
-  convertedSize?: number
+  convertedBlob: Blob | null
+  convertedSize: number | null
+  error: string | null
 }
 
-const supportedExtensions = ["jpg", "jpeg", "png", "webp"]
-const targetFormats = [
-  { value: "jpg", label: "JPG" },
-  { value: "png", label: "PNG" },
-  { value: "webp", label: "WEBP" },
-] as const
+const ACCEPTED_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp']
+const ACCEPTED_EXT = ['.jpg', '.jpeg', '.png', '.webp']
 
-function formatBytes(bytes: number) {
+const FORMAT_LABEL: Record<TargetFormat, string> = {
+  webp: 'WEBP',
+  jpeg: 'JPG',
+  png: 'PNG',
+}
+
+const FORMAT_MIME: Record<TargetFormat, string> = {
+  webp: 'image/webp',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+}
+
+function bytesToReadable(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
-function extractFormat(name: string) {
-  const match = name.toLowerCase().match(/\.([a-z0-9]+)$/)
-  const ext = match?.[1] ?? ""
-  return supportedExtensions.includes(ext) ? ext.toUpperCase() : "FILE"
+function extOf(filename: string): string {
+  const parts = filename.split('.')
+  return parts.length > 1 ? parts[parts.length - 1].toLowerCase() : ''
 }
 
-function App() {
-  const [files, setFiles] = useState<AppFile[]>([])
-  const [targetFormat, setTargetFormat] = useState<typeof targetFormats[number]["value"]>("webp")
-  const [quality, setQuality] = useState(85)
-  const [zipStatus, setZipStatus] = useState<"idle" | "preparing" | "ready">("idle")
+function makeId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+}
 
-  const fileInputId = "snapwebp-file-input"
+function stripExt(filename: string): string {
+  const idx = filename.lastIndexOf('.')
+  return idx === -1 ? filename : filename.slice(0, idx)
+}
 
-  const hasFiles = files.length > 0
-  const showQuality = targetFormat !== "png"
+// Core conversion: decode source file onto a canvas, re-encode as target format.
+async function convertImage(
+  file: File,
+  target: TargetFormat,
+  quality: number,
+  bgColor: string,
+): Promise<Blob> {
+  const bitmap = await createImageBitmap(file)
+  const canvas = document.createElement('canvas')
+  canvas.width = bitmap.width
+  canvas.height = bitmap.height
 
-  const handleFiles = (incoming: FileList | File[]) => {
-    const newFiles: AppFile[] = Array.from(incoming)
-      .filter((file) => {
-        const ext = file.name.toLowerCase().split(".").pop() ?? ""
-        return supportedExtensions.includes(ext)
-      })
-      .map((file) => ({
-        id: `${file.name}-${file.size}-${Date.now()}`,
-        name: file.name,
-        originalSize: file.size,
-        originalFormat: extractFormat(file.name),
-        status: "pending" as FileStatus,
-      }))
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Canvas not supported in this browser')
 
-    if (newFiles.length > 0) {
-      setFiles((current) => [...current, ...newFiles])
-      setZipStatus("idle")
-    }
+  // JPG has no alpha channel — flatten transparency onto a background color
+  // so it doesn't silently render black.
+  if (target === 'jpeg') {
+    ctx.fillStyle = bgColor
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
   }
 
-  const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
-    event.preventDefault()
-    event.stopPropagation()
-    if (event.dataTransfer.files.length) {
-      handleFiles(event.dataTransfer.files)
-    }
-  }
+  ctx.drawImage(bitmap, 0, 0)
+  bitmap.close()
 
-  const handleBrowse = (event: React.ChangeEvent<HTMLInputElement>) => {
-    if (event.target.files) {
-      handleFiles(event.target.files)
-      event.target.value = ""
-    }
-  }
+  const mime = FORMAT_MIME[target]
+  const q = target === 'png' ? undefined : quality / 100
 
-  const removeFile = (id: string) => {
-    setFiles((current) => current.filter((file) => file.id !== id))
-  }
-
-  const convertAll = () => {
-    if (!hasFiles) return
-    setFiles((current) =>
-      current.map((file) => ({
-        ...file,
-        status: file.status === "done" ? "done" : "converting",
-      }))
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) resolve(blob)
+        else reject(new Error('Conversion failed — browser could not encode this format'))
+      },
+      mime,
+      q,
     )
+  })
+}
 
-    setTimeout(() => {
-      setFiles((current) =>
-        current.map((file) => ({
-          ...file,
-          status: "done",
-          convertedSize: Math.max(1024, Math.round(file.originalSize * (targetFormat === "png" ? 1 : 0.7))),
-        }))
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+// Minimal ZIP writer (store-only, no compression) so we don't pull in a dependency.
+async function buildZip(entries: { name: string; blob: Blob }[]): Promise<Blob> {
+  const fileRecords: { name: string; data: Uint8Array; crc: number; offset: number }[] = []
+  const chunks: BlobPart[] = []
+  let offset = 0
+
+  function crc32(data: Uint8Array): number {
+    let c
+    let crc = 0xffffffff
+    for (let i = 0; i < data.length; i++) {
+      c = (crc ^ data[i]) & 0xff
+      for (let j = 0; j < 8; j++) {
+        c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1
+      }
+      crc = (crc >>> 8) ^ c
+    }
+    return (crc ^ 0xffffffff) >>> 0
+  }
+
+  function writeUint32(arr: number[], val: number) {
+    arr.push(val & 0xff, (val >>> 8) & 0xff, (val >>> 16) & 0xff, (val >>> 24) & 0xff)
+  }
+  function writeUint16(arr: number[], val: number) {
+    arr.push(val & 0xff, (val >>> 8) & 0xff)
+  }
+
+  for (const entry of entries) {
+    const data = new Uint8Array(await entry.blob.arrayBuffer())
+    const crc = crc32(data)
+    const nameBytes = new TextEncoder().encode(entry.name)
+
+    const local: number[] = []
+    writeUint32(local, 0x04034b50)
+    writeUint16(local, 20)
+    writeUint16(local, 0)
+    writeUint16(local, 0)
+    writeUint16(local, 0)
+    writeUint16(local, 0)
+    writeUint32(local, crc)
+    writeUint32(local, data.length)
+    writeUint32(local, data.length)
+    writeUint16(local, nameBytes.length)
+    writeUint16(local, 0)
+
+    const localHeader = new Uint8Array(local)
+    chunks.push(localHeader, nameBytes, data)
+    fileRecords.push({ name: entry.name, data, crc, offset })
+    offset += localHeader.length + nameBytes.length + data.length
+  }
+
+  const centralStart = offset
+  for (const rec of fileRecords) {
+    const nameBytes = new TextEncoder().encode(rec.name)
+    const central: number[] = []
+    writeUint32(central, 0x02014b50)
+    writeUint16(central, 20)
+    writeUint16(central, 20)
+    writeUint16(central, 0)
+    writeUint16(central, 0)
+    writeUint16(central, 0)
+    writeUint16(central, 0)
+    writeUint32(central, rec.crc)
+    writeUint32(central, rec.data.length)
+    writeUint32(central, rec.data.length)
+    writeUint16(central, nameBytes.length)
+    writeUint16(central, 0)
+    writeUint16(central, 0)
+    writeUint16(central, 0)
+    writeUint16(central, 0)
+    writeUint32(central, 0)
+    writeUint32(central, rec.offset)
+    chunks.push(new Uint8Array(central), nameBytes)
+    offset += central.length + nameBytes.length
+  }
+
+  const centralSize = offset - centralStart
+  const end: number[] = []
+  writeUint32(end, 0x06054b50)
+  writeUint16(end, 0)
+  writeUint16(end, 0)
+  writeUint16(end, fileRecords.length)
+  writeUint16(end, fileRecords.length)
+  writeUint32(end, centralSize)
+  writeUint32(end, centralStart)
+  writeUint16(end, 0)
+  chunks.push(new Uint8Array(end))
+
+  return new Blob(chunks, { type: 'application/zip' })
+}
+
+export default function App() {
+  const [queue, setQueue] = useState<QueueItem[]>([])
+  const [target, setTarget] = useState<TargetFormat>('webp')
+  const [quality, setQuality] = useState(85)
+  const [bgColor, setBgColor] = useState('#ffffff')
+  const [isDragging, setIsDragging] = useState(false)
+  const [isZipping, setIsZipping] = useState(false)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const addFiles = useCallback((files: FileList | File[]) => {
+    const accepted: QueueItem[] = []
+    for (const file of Array.from(files)) {
+      const ext = extOf(file.name)
+      const validType = ACCEPTED_TYPES.includes(file.type)
+      const validExt = ACCEPTED_EXT.includes(`.${ext}`)
+      if (!validType && !validExt) continue
+      accepted.push({
+        id: makeId(),
+        file,
+        originalSize: file.size,
+        originalExt: ext || 'unknown',
+        status: 'idle',
+        convertedBlob: null,
+        convertedSize: null,
+        error: null,
+      })
+    }
+    if (accepted.length > 0) {
+      setQueue((prev) => [...prev, ...accepted])
+    }
+  }, [])
+
+  const onDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault()
+      setIsDragging(false)
+      if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files)
+    },
+    [addFiles],
+  )
+
+  const onFileInputChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (e.target.files?.length) addFiles(e.target.files)
+      e.target.value = ''
+    },
+    [addFiles],
+  )
+
+  const removeItem = useCallback((id: string) => {
+    setQueue((prev) => prev.filter((item) => item.id !== id))
+  }, [])
+
+  const clearAll = useCallback(() => {
+    setQueue([])
+  }, [])
+
+  const convertOne = useCallback(
+    async (id: string) => {
+      setQueue((prev) =>
+        prev.map((item) => (item.id === id ? { ...item, status: 'converting', error: null } : item)),
       )
-    }, 800)
-  }
+      setQueue((prev) => {
+        const item = prev.find((i) => i.id === id)
+        if (!item) return prev
+        convertImage(item.file, target, quality, bgColor)
+          .then((blob) => {
+            setQueue((p) =>
+              p.map((i) =>
+                i.id === id
+                  ? { ...i, status: 'done', convertedBlob: blob, convertedSize: blob.size }
+                  : i,
+              ),
+            )
+          })
+          .catch((err: Error) => {
+            setQueue((p) =>
+              p.map((i) => (i.id === id ? { ...i, status: 'error', error: err.message } : i)),
+            )
+          })
+        return prev
+      })
+    },
+    [target, quality, bgColor],
+  )
 
-  const downloadFile = (file: AppFile) => {
-    console.log("download", file.name)
-  }
+  const convertAll = useCallback(() => {
+    queue.forEach((item) => {
+      if (item.status !== 'done') convertOne(item.id)
+    })
+  }, [queue, convertOne])
 
-  const downloadAllZip = () => {
-    if (!hasFiles) return
-    setZipStatus("preparing")
-    setTimeout(() => setZipStatus("ready"), 900)
-  }
+  const downloadOne = useCallback(
+    (item: QueueItem) => {
+      if (!item.convertedBlob) return
+      const base = stripExt(item.file.name)
+      downloadBlob(item.convertedBlob, `${base}.${target === 'jpeg' ? 'jpg' : target}`)
+    },
+    [target],
+  )
 
-  const activeButtonLabel = useMemo(() => {
-    if (!hasFiles) return "Convert all"
-    if (zipStatus === "preparing") return "Preparing ZIP..."
-    return "Download all as ZIP"
-  }, [hasFiles, zipStatus])
+  const downloadAllZip = useCallback(async () => {
+    const doneItems = queue.filter((i) => i.status === 'done' && i.convertedBlob)
+    if (doneItems.length === 0) return
+    setIsZipping(true)
+    try {
+      const entries = doneItems.map((item) => ({
+        name: `${stripExt(item.file.name)}.${target === 'jpeg' ? 'jpg' : target}`,
+        blob: item.convertedBlob as Blob,
+      }))
+      const zip = await buildZip(entries)
+      downloadBlob(zip, 'converted-images.zip')
+    } finally {
+      setIsZipping(false)
+    }
+  }, [queue, target])
+
+  const doneCount = queue.filter((i) => i.status === 'done').length
+  const showBgPicker = target === 'jpeg'
 
   return (
-    <div className="app-shell">
-      <style>{`
-        :root {
-          color-scheme: light;
-          --bg: #f7f6f3;
-          --surface: #ffffff;
-          --border: #e5e3de;
-          --text: #1a1a1a;
-          --muted: #6f6f6f;
-          --accent: #3b5bdb;
-          --accent-soft: rgba(59, 91, 219, 0.08);
-          --focus: rgba(59, 91, 219, 0.34);
-          --radius: 4px;
-          font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        }
+    <div className="app">
+      <header className="header">
+        <h1 className="title">imgswap</h1>
+        <p className="subtitle">Convert JPG, PNG, and WEBP — entirely in your browser. No upload, no limits.</p>
+      </header>
 
-        * {
-          box-sizing: border-box;
-        }
+      <section
+        className={`dropzone ${isDragging ? 'dropzone--active' : ''}`}
+        onDragOver={(e) => {
+          e.preventDefault()
+          setIsDragging(true)
+        }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={onDrop}
+        onClick={() => inputRef.current?.click()}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') inputRef.current?.click()
+        }}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+          multiple
+          onChange={onFileInputChange}
+          className="visually-hidden"
+        />
+        <p className="dropzone-text">
+          Drag and drop images here, or <span className="dropzone-link">browse files</span>
+        </p>
+        <p className="dropzone-hint">Supports JPG, JPEG, PNG, WEBP</p>
+      </section>
 
-        body {
-          margin: 0;
-          background: var(--bg);
-          color: var(--text);
-        }
-
-        .app-shell {
-          min-height: 100vh;
-          padding: 32px 24px;
-          background: var(--bg);
-        }
-
-        .app-frame {
-          max-width: 940px;
-          margin: 0 auto;
-          display: flex;
-          flex-direction: column;
-          gap: 24px;
-        }
-
-        .top-row {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 16px;
-          justify-content: space-between;
-          align-items: flex-start;
-        }
-
-        .title-block {
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-        }
-
-        .title-block h1 {
-          margin: 0;
-          font-size: clamp(1.8rem, 2.4vw, 2.5rem);
-          letter-spacing: -0.03em;
-          font-weight: 700;
-        }
-
-        .title-block p {
-          margin: 0;
-          color: var(--muted);
-          max-width: 44rem;
-          line-height: 1.6;
-        }
-
-        .panel {
-          background: var(--surface);
-          border: 1px solid var(--border);
-          padding: 22px;
-          border-radius: var(--radius);
-        }
-
-        .control-row {
-          display: grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
-          gap: 16px;
-          align-items: end;
-        }
-
-        .control-row label {
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
-          font-size: 0.9rem;
-          color: var(--muted);
-        }
-
-        .control-row select,
-        .control-row input[type="range"] {
-          width: 100%;
-        }
-
-        select,
-        input,
-        button {
-          font: inherit;
-        }
-
-        select,
-        input[type="range"],
-        .file-input-button,
-        .action-group button {
-          border: 1px solid var(--border);
-          border-radius: 4px;
-          background: #fff;
-          color: var(--text);
-        }
-
-        select {
-          height: 44px;
-          padding: 0 12px;
-          appearance: none;
-        }
-
-        input[type="range"] {
-          accent-color: var(--accent);
-        }
-
-        .file-input-button {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          gap: 10px;
-          padding: 0 16px;
-          min-height: 44px;
-          cursor: pointer;
-        }
-
-        .file-input-button:hover,
-        .action-group button:hover {
-          border-color: var(--accent);
-        }
-
-        button {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          gap: 8px;
-          padding: 0 18px;
-          min-height: 44px;
-          cursor: pointer;
-          transition: background 120ms ease, border-color 120ms ease;
-        }
-
-        button:focus-visible,
-        select:focus-visible,
-        .file-input-button:focus-visible {
-          outline: 2px solid var(--focus);
-          outline-offset: 2px;
-        }
-
-        .action-group {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 12px;
-          justify-content: flex-end;
-        }
-
-        .action-primary {
-          background: var(--accent);
-          color: white;
-          border-color: var(--accent);
-        }
-
-        .action-secondary {
-          background: transparent;
-        }
-
-        .upload-zone {
-          border: 1px dashed var(--border);
-          background: var(--accent-soft);
-          min-height: 182px;
-          display: grid;
-          place-items: center;
-          text-align: center;
-          padding: 22px;
-          border-radius: var(--radius);
-          position: relative;
-        }
-
-        .upload-zone input {
-          position: absolute;
-          inset: 0;
-          width: 100%;
-          height: 100%;
-          opacity: 0;
-          cursor: pointer;
-        }
-
-        .upload-zone h2 {
-          margin: 0;
-          font-size: 1.05rem;
-        }
-
-        .upload-zone p {
-          margin: 10px 0 0;
-          color: var(--muted);
-          font-size: 0.95rem;
-          line-height: 1.6;
-        }
-
-        .upload-zone .small-text {
-          margin-top: 8px;
-          font-size: 0.83rem;
-        }
-
-        .file-table {
-          width: 100%;
-          border-collapse: collapse;
-          margin-top: 12px;
-        }
-
-        .file-table th,
-        .file-table td {
-          text-align: left;
-          padding: 14px 12px;
-          border-bottom: 1px solid var(--border);
-          font-size: 0.95rem;
-        }
-
-        .file-table th {
-          color: var(--muted);
-          font-weight: 600;
-        }
-
-        .file-table tbody tr:last-child td {
-          border-bottom: none;
-        }
-
-        .file-list-row {
-          display: grid;
-          grid-template-columns: 1fr auto;
-          gap: 12px;
-          align-items: center;
-        }
-
-        .file-list-main {
-          display: grid;
-          gap: 8px;
-        }
-
-        .file-list-name {
-          font-family: "JetBrains Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
-          font-size: 0.95rem;
-          margin: 0;
-          color: var(--text);
-          word-break: break-word;
-        }
-
-        .file-list-meta {
-          color: var(--muted);
-          font-size: 0.86rem;
-          display: flex;
-          flex-wrap: wrap;
-          gap: 10px;
-        }
-
-        .file-actions {
-          display: flex;
-          gap: 8px;
-          align-items: center;
-        }
-
-        .small-button {
-          background: transparent;
-          border: 1px solid var(--border);
-          padding: 8px;
-          width: 38px;
-          height: 38px;
-        }
-
-        .small-button:hover {
-          border-color: var(--accent);
-        }
-
-        .progress-bar {
-          height: 6px;
-          background: #e9e7e3;
-          border-radius: 999px;
-          overflow: hidden;
-          margin-top: 8px;
-        }
-
-        .progress-bar span {
-          display: block;
-          height: 100%;
-          width: 0%;
-          background: var(--accent);
-          transition: width 0.2s ease;
-        }
-
-        .status-label {
-          font-size: 0.82rem;
-          color: var(--muted);
-        }
-
-        .empty-state {
-          padding: 30px 0;
-          color: var(--muted);
-          font-size: 0.98rem;
-          line-height: 1.6;
-        }
-
-        @media (max-width: 720px) {
-          .top-row {
-            flex-direction: column;
-          }
-
-          .control-row {
-            grid-template-columns: 1fr;
-          }
-
-          .action-group {
-            justify-content: stretch;
-          }
-
-          .file-table th,
-          .file-table td {
-            padding: 12px 10px;
-          }
-
-          .file-list-row {
-            grid-template-columns: 1fr;
-          }
-
-          .file-actions {
-            justify-content: flex-start;
-          }
-        }
-      `}</style>
-
-      <main className="app-frame">
-        <section className="top-row">
-          <div className="title-block">
-            <h1>Snapwebp</h1>
-            <p>
-              Convert JPG, PNG, and WEBP files in batch with a clean, utility-first interface. Drop images, choose a
-              target format, and keep all controls visible with minimal distractions.
-            </p>
+      <section className="controls">
+        <div className="control-group">
+          <label className="control-label" htmlFor="target-format">
+            Convert to
+          </label>
+          <div className="segmented" id="target-format">
+            {(['webp', 'jpeg', 'png'] as TargetFormat[]).map((fmt) => (
+              <button
+                key={fmt}
+                type="button"
+                className={`segmented-option ${target === fmt ? 'segmented-option--active' : ''}`}
+                onClick={() => setTarget(fmt)}
+              >
+                {FORMAT_LABEL[fmt]}
+              </button>
+            ))}
           </div>
-          <div className="action-group">
-            <button className="action-primary" type="button" onClick={convertAll} disabled={!hasFiles}>
-              Convert all
-            </button>
-            <button className="action-secondary" type="button" onClick={downloadAllZip} disabled={!hasFiles}>
-              {activeButtonLabel}
-            </button>
-          </div>
-        </section>
+        </div>
 
-        <section className="panel">
-          <div className="control-row">
-            <label>
-              Target format
-              <select value={targetFormat} onChange={(event) => setTargetFormat(event.target.value as any)}>
-                {targetFormats.map((format) => (
-                  <option key={format.value} value={format.value}>
-                    {format.label}
-                  </option>
-                ))}
-              </select>
+        {target !== 'png' && (
+          <div className="control-group">
+            <label className="control-label" htmlFor="quality">
+              Quality — {quality}
             </label>
+            <input
+              id="quality"
+              type="range"
+              min={1}
+              max={100}
+              value={quality}
+              onChange={(e) => setQuality(Number(e.target.value))}
+              className="slider"
+            />
+          </div>
+        )}
 
-            {showQuality ? (
-              <label>
-                Quality {quality}%
-                <input
-                  type="range"
-                  min={0}
-                  max={100}
-                  value={quality}
-                  onChange={(event) => setQuality(Number(event.target.value))}
-                />
-              </label>
-            ) : (
-              <div />
-            )}
-
-            <label className="file-input-button" htmlFor={fileInputId}>
-              <span>Browse files</span>
-              <input
-                id={fileInputId}
-                type="file"
-                accept={supportedExtensions.map((ext) => `.${ext}`).join(",")}
-                multiple
-                onChange={handleBrowse}
-              />
+        {showBgPicker && (
+          <div className="control-group">
+            <label className="control-label" htmlFor="bgcolor">
+              Background (for transparent images)
             </label>
+            <input
+              id="bgcolor"
+              type="color"
+              value={bgColor}
+              onChange={(e) => setBgColor(e.target.value)}
+              className="color-input"
+            />
           </div>
-        </section>
+        )}
+      </section>
 
-        <section className="panel">
-          <div
-            className="upload-zone"
-            onDragOver={(event) => event.preventDefault()}
-            onDrop={handleDrop}
-          >
-            <div>
-              <h2>Drag images here</h2>
-              <p>Supported formats: JPG, JPEG, PNG, WEBP</p>
-              <p className="small-text">Click anywhere to browse files</p>
+      {queue.length > 0 && (
+        <section className="queue">
+          <div className="queue-header">
+            <span className="queue-count">
+              {queue.length} file{queue.length !== 1 ? 's' : ''}
+            </span>
+            <div className="queue-actions">
+              <button type="button" className="btn btn--ghost" onClick={clearAll}>
+                Clear all
+              </button>
+              <button type="button" className="btn btn--secondary" onClick={convertAll}>
+                Convert all
+              </button>
+              <button
+                type="button"
+                className="btn btn--primary"
+                onClick={downloadAllZip}
+                disabled={doneCount === 0 || isZipping}
+              >
+                {isZipping ? 'Zipping…' : `Download all (${doneCount})`}
+              </button>
             </div>
           </div>
 
-          {hasFiles ? (
-            <div style={{ marginTop: 20 }}>
-              <table className="file-table">
-                <thead>
-                  <tr>
-                    <th>File</th>
-                    <th>Details</th>
-                    <th style={{ textAlign: "right" }}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {files.map((file) => {
-                    const progress = file.status === "converting" ? 65 : file.status === "done" ? 100 : 0
-                    return (
-                      <tr key={file.id}>
-                        <td>
-                          <div className="file-list-main">
-                            <p className="file-list-name">{file.name}</p>
-                            <div className="file-list-meta">
-                              <span>{formatBytes(file.originalSize)}</span>
-                              <span>{file.originalFormat} → {targetFormat.toUpperCase()}</span>
-                              {file.status === "done" ? <span>{formatBytes(file.convertedSize ?? file.originalSize)}</span> : null}
-                            </div>
-                            <div className="progress-bar" aria-hidden="true">
-                              <span style={{ width: `${progress}%` }} />
-                            </div>
-                            <div className="status-label">
-                              {file.status === "pending" && "Pending conversion"}
-                              {file.status === "converting" && "Converting…"}
-                              {file.status === "done" && "Ready to download"}
-                            </div>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="file-list-meta">
-                            <span>Original: {file.originalFormat}</span>
-                            <span>Target: {targetFormat.toUpperCase()}</span>
-                            {file.status === "done" && <span>Converted: {formatBytes(file.convertedSize ?? file.originalSize)}</span>}
-                          </div>
-                        </td>
-                        <td style={{ textAlign: "right" }}>
-                          <div className="file-actions">
-                            <button className="small-button" type="button" onClick={() => downloadFile(file)}>
-                              Download
-                            </button>
-                            <button className="small-button" type="button" onClick={() => removeFile(file.id)}>
-                              Remove
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div className="empty-state">
-              Drop supported image files or click the browse button to start. All conversions are handled in the browser.
-            </div>
-          )}
+          <ul className="file-list">
+            {queue.map((item) => (
+              <li key={item.id} className="file-row" data-status={item.status}>
+                <div className="file-info">
+                  <span className="file-name">{item.file.name}</span>
+                  <span className="file-meta">
+                    {bytesToReadable(item.originalSize)}
+                    <span className="file-arrow"> → </span>
+                    {FORMAT_LABEL[target]}
+                    {item.status === 'done' && item.convertedSize !== null && (
+                      <> · {bytesToReadable(item.convertedSize)}</>
+                    )}
+                  </span>
+                  {item.status === 'converting' && (
+                    <span className="file-progress" aria-hidden="true">
+                      <span className="file-progress-bar" />
+                    </span>
+                  )}
+                </div>
+
+                <div className="file-status">
+                  {item.status === 'idle' && (
+                    <button type="button" className="btn btn--small" onClick={() => convertOne(item.id)}>
+                      Convert
+                    </button>
+                  )}
+                  {item.status === 'converting' && <span className="status-text">Converting…</span>}
+                  {item.status === 'done' && (
+                    <button
+                      type="button"
+                      className="btn btn--small btn--secondary"
+                      onClick={() => downloadOne(item)}
+                    >
+                      Download
+                    </button>
+                  )}
+                  {item.status === 'error' && (
+                    <span className="status-text status-text--error" title={item.error ?? ''}>
+                      Failed
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    aria-label={`Remove ${item.file.name}`}
+                    onClick={() => removeItem(item.id)}
+                  >
+                    ×
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
         </section>
-      </main>
+      )}
+
+      {queue.length === 0 && (
+        <p className="empty-state">No files yet. Add images above to get started.</p>
+      )}
     </div>
   )
 }
-
-export default App
