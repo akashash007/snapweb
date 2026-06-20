@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 type TargetFormat = 'webp' | 'jpeg' | 'png'
 
@@ -48,6 +48,14 @@ function makeId(): string {
 function stripExt(filename: string): string {
   const idx = filename.lastIndexOf('.')
   return idx === -1 ? filename : filename.slice(0, idx)
+}
+
+function makeFallbackFilename(mimeType: string): string {
+  let ext = 'png'
+  if (mimeType === 'image/jpeg' || mimeType === 'image/jpg') ext = 'jpg'
+  else if (mimeType === 'image/webp') ext = 'webp'
+  else if (mimeType === 'image/png') ext = 'png'
+  return `pasted-image-${Date.now()}.${ext}`
 }
 
 // Core conversion: decode source file onto a canvas, re-encode as target format.
@@ -240,6 +248,33 @@ export default function App() {
     [addFiles],
   )
 
+  const onPaste = useCallback(
+    (event: ClipboardEvent) => {
+      const items = event.clipboardData?.items
+      if (!items?.length) return
+
+      const files: File[] = []
+      for (const item of Array.from(items)) {
+        if (item.kind !== 'file' || !item.type.startsWith('image/')) continue
+        const file = item.getAsFile()
+        if (!file) continue
+        if (!file.name) {
+          files.push(new File([file], makeFallbackFilename(file.type), { type: file.type }))
+        } else {
+          files.push(file)
+        }
+      }
+
+      if (files.length > 0) addFiles(files)
+    },
+    [addFiles],
+  )
+
+  useEffect(() => {
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [onPaste])
+
   const removeItem = useCallback((id: string) => {
     setQueue((prev) => prev.filter((item) => item.id !== id))
   }, [])
@@ -344,7 +379,9 @@ export default function App() {
         <p className="dropzone-text">
           Drag and drop images here, or <span className="dropzone-link">browse files</span>
         </p>
-        <p className="dropzone-hint">Supports JPG, JPEG, PNG, WEBP</p>
+        <p className="dropzone-hint">
+          Supports JPG, JPEG, PNG, WEBP — or paste an image (Ctrl+V)
+        </p>
       </section>
 
       <section className="controls">
